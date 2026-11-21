@@ -49,12 +49,16 @@ class Bot:
         self.my_hits = set()
         self.practice_aggro_hp = 0.6
         self.practice_aggro_range = 110
-        self.practice_confirm_t = 40.0
+        self.practice_confirm_t = 15.0
         self.my_kills = 0
         self.retreating = False
         self.farm_until = 200.0
-        import os
+        import os, json as _json
         self.debug = bool(os.environ.get('BOT_DEBUG'))
+        self.dodge_on = True
+        self._overrides = _json.loads(os.environ.get('BOT_PARAMS', '{}') or '{}')
+        for k, v in self._overrides.items():
+            setattr(self, k, v)
 
     def los(self, a, b):
         return bool(self.w.los_many([a], [b])[0])
@@ -377,6 +381,11 @@ class Bot:
             for s, w in enumerate(me['weapons']):
                 if w and w['kind'] == 'laser' and (w.get('charge', 0) > 0):
                     fire[s] = True
+        if self.dodge_on:
+            dv, dboost = self.dodge(obs, me, mechs)
+            if dv is not None:
+                mv = [mv[0] * 0.35 + dv[0], mv[1] * 0.35 + dv[1]]
+                boost = boost or (dboost and me['energy'] > 15)
         mv, jump = self.unstick(t, pos, mv)
         act['move'] = [round(mv[0], 3), round(mv[1], 3)]
         act['boost'] = bool(boost)
@@ -391,6 +400,65 @@ class Bot:
             mf.log(f"t={t:.0f} {self.mode} hp={me['hp']:.0f}/{me['max_hp']:.0f} cubes={me['cubes']} w={[w['kind'] if w else None for w in me['weapons']]} tgt={(target['id'] if target else None)} vis={vis[:4]} dmg={len(self.dmg_log)}")
         mf.draw.label(f"{self.mode} hp{me['hp']:.0f} {(time.perf_counter() - t0) * 1000:.0f}ms")
         return act
+
+    def dodge(self, obs, me, mechs):
+        pos = me['pos']
+        h = me['stats'].get('height', 9)
+        c = [pos[0], pos[1], pos[2] + h / 2]
+        r = me['stats'].get('radius', 2.5)
+        best = None
+        for p in obs['projectiles']:
+            v = p['vel']
+            if p['kind'] == 'mortar':
+                g = self.cfg['weapons']['mortar']['gravity']
+                a, b, cc = (-0.5 * g, v[2], p['pos'][2] - pos[2])
+                disc = b * b - 4 * a * cc
+                if disc < 0:
+                    continue
+                tl = (-b - math.sqrt(disc)) / (2 * a)
+                if not 0 < tl < 3.5:
+                    continue
+                ix, iy = (p['pos'][0] + v[0] * tl, p['pos'][1] + v[1] * tl)
+                d = math.hypot(ix - pos[0], iy - pos[1])
+                if d < 11:
+                    ax, ay = (pos[0] - ix, pos[1] - iy)
+                    L = math.hypot(ax, ay) or 1.0
+                    w = (11 - d) / 11 + 0.5
+                    if best is None or w > best[2]:
+                        best = (ax / L, ay / L, w)
+                continue
+            rx, ry, rz = (c[0] - p['pos'][0], c[1] - p['pos'][1], c[2] - p['pos'][2])
+            vv = v[0] * v[0] + v[1] * v[1] + v[2] * v[2]
+            if vv < 1:
+                continue
+            ts = (rx * v[0] + ry * v[1] + rz * v[2]) / vv
+            if not 0.03 < ts < 0.9:
+                continue
+            mx, my = (rx - v[0] * ts, ry - v[1] * ts)
+            dmiss = math.hypot(mx, my)
+            if dmiss < r + 2.0:
+                vh = math.hypot(v[0], v[1]) or 1.0
+                px, py = (-v[1] / vh, v[0] / vh)
+                if px * mx + py * my < 0:
+                    px, py = (-px, py * -1)
+                w = 1.0 - dmiss / (r + 2.0) + 0.3
+                if best is None or w > best[2]:
+                    best = (px, py, w)
+        for m in mechs:
+            if not m.get('charging'):
+                continue
+            dd = d2(m['pos'], pos)
+            if dd > 290:
+                continue
+            to_me = math.atan2(pos[1] - m['pos'][1], pos[0] - m['pos'][0])
+            if abs(wrap(m.get('aim', [9, 0])[0] - to_me)) < math.atan2(r + 3, max(dd, 1)) + 0.05:
+                px, py = (-math.sin(to_me), math.cos(to_me))
+                if self.strafe < 0:
+                    px, py = (-px, -py)
+                best = (px, py, 2.0)
+        if best is None:
+            return (None, False)
+        return ([best[0], best[1]], best[2] > 0.8)
 
     def detect_ffa(self, obs, mechs, npcs):
         if self.ffa:
