@@ -58,6 +58,15 @@ class Bot:
         self.third_hp = 0.6
         self.energy_reserve = 30
         self.drop_range = 220
+        self.jump_dodge = False
+        self.jump_p = 0.35
+        self.want_jump = False
+        self.roof_cover = False
+        self.roof_plan = None
+        self.roof_jump = False
+        self.roof_boost = False
+        self.roof_until = -1.0
+        self.roof_pts = None
         import os, json as _json
         self.debug = bool(os.environ.get('BOT_DEBUG'))
         self.dodge_on = True
@@ -316,9 +325,9 @@ class Bot:
         if target is not None:
             if hpf < self.r1 and (not (n_close <= 1 and target['hp'] < me['hp'] * 0.6)):
                 self.retreating = True
-            if n_close >= 2 and hpf < self.r2:
+            if n_close >= 2 and hpf < (self.r2 if self.ffa else 0.65):
                 self.retreating = True
-            if n_close >= 3 and hpf < self.r3:
+            if n_close >= 3 and hpf < (self.r3 if self.ffa else 0.85):
                 self.retreating = True
         if self.retreating:
             if hpf > self.rexit:
@@ -341,11 +350,14 @@ class Bot:
             goal = [c[0] + (pos[0] - c[0]) * 0.3, c[1] + (pos[1] - c[1]) * 0.3]
             mv = self.steer(t, pos, goal)
             boost = not in_zone or me['energy'] > 50
-        elif self.drop_goal(obs, me, target) is not None:
+        elif self.ffa and self.drop_goal(obs, me, target) is not None:
             dg = self.drop_goal(obs, me, target)
             self.mode = 'drop'
             mv = self.steer(t, pos, dg['pos']) if d2(dg['pos'], pos) > 3 else [0.0, 0.0]
             boost = d2(dg['pos'], pos) > 40 and me['energy'] > self.energy_reserve
+        elif target is not None and self.retreating and self.roof_cover and self.ffa and (self.roof_step(obs, me, threats) is not None):
+            self.mode = 'roof'
+            mv = self.roof_step(obs, me, threats)
         elif target is not None and self.retreating:
             self.mode = 'retreat'
             if t - self.cover_t > 1.0 or self.cover is None:
@@ -403,7 +415,7 @@ class Bot:
             for s, w in enumerate(me['weapons']):
                 if w and w['kind'] == 'laser' and (w.get('charge', 0) > 0):
                     fire[s] = True
-        if boost and me['energy'] < self.energy_reserve and (self.mode not in ('retreat', 'zone')) and in_zone:
+        if self.ffa and boost and (me['energy'] < self.energy_reserve) and (self.mode not in ('retreat', 'zone')) and in_zone:
             boost = False
         if self.dodge_on:
             dv, dboost = self.dodge(obs, me, mechs)
@@ -411,6 +423,12 @@ class Bot:
                 mv = [mv[0] * 0.35 + dv[0], mv[1] * 0.35 + dv[1]]
                 boost = boost or (dboost and me['energy'] > 15)
         mv, jump = self.unstick(t, pos, mv)
+        if self.want_jump:
+            jump = True
+            self.want_jump = False
+        if self.roof_plan is not None:
+            jump = jump or self.roof_jump
+            boost = boost or self.roof_boost
         act['move'] = [round(mv[0], 3), round(mv[1], 3)]
         act['boost'] = bool(boost)
         act['jump'] = bool(jump)
@@ -424,6 +442,52 @@ class Bot:
             mf.log(f"t={t:.0f} {self.mode} hp={me['hp']:.0f}/{me['max_hp']:.0f} cubes={me['cubes']} w={[w['kind'] if w else None for w in me['weapons']]} tgt={(target['id'] if target else None)} vis={vis[:4]} dmg={len(self.dmg_log)}")
         mf.draw.label(f"{self.mode} hp{me['hp']:.0f} {(time.perf_counter() - t0) * 1000:.0f}ms")
         return act
+
+    def roof_candidates(self):
+        if self.roof_pts is None:
+            pts = []
+            for x, y, top in self.w.roof_cells:
+                g = self.w.ground(x, y)
+                if 4.0 <= top - g <= 15.0:
+                    pts.append((x, y, top))
+            self.roof_pts = pts
+        return self.roof_pts
+
+    def roof_step(self, obs, me, threats):
+        t = obs['t']
+        pos = me['pos']
+        self.roof_jump = False
+        self.roof_boost = False
+        if self.roof_plan is None:
+            if me['energy'] < 45 or not threats:
+                return None
+            best, bs = (None, 1000000000.0)
+            for x, y, top in self.roof_candidates():
+                dd = math.hypot(x - pos[0], y - pos[1])
+                if dd < 6 or dd > 35 or top - pos[2] > 15 or (not self.point_in_safe(obs, (x, y), 0.85)):
+                    continue
+                away = min((d2((x, y), e['pos']) for e in threats))
+                sc = dd - 0.4 * min(away, 80)
+                if sc < bs:
+                    best, bs = ((x, y, top), sc)
+            if best is None:
+                return None
+            self.roof_plan = best
+            self.roof_until = t + 6.0
+        x, y, top = self.roof_plan
+        if t > self.roof_until or (pos[2] >= top - 0.3 and math.hypot(x - pos[0], y - pos[1]) < 3):
+            self.roof_plan = None
+            return None
+        dx, dy = (x - pos[0], y - pos[1])
+        dd = math.hypot(dx, dy) or 1.0
+        mv = [dx / dd, dy / dd]
+        if pos[2] < top + 0.5:
+            near_wall = dd < 9 or self.stuck > 0.2
+            if near_wall:
+                if me.get('grounded'):
+                    self.roof_jump = True
+                self.roof_boost = me['energy'] > 3
+        return mv
 
     def drop_goal(self, obs, me, target):
         pos = me['pos']
@@ -467,6 +531,7 @@ class Bot:
                         best = (ax / L, ay / L, w)
                 continue
             rx, ry, rz = (c[0] - p['pos'][0], c[1] - p['pos'][1], c[2] - p['pos'][2])
+            bullet = True
             vv = v[0] * v[0] + v[1] * v[1] + v[2] * v[2]
             if vv < 1:
                 continue
@@ -497,6 +562,8 @@ class Bot:
                 best = (px, py, 2.0)
         if best is None:
             return (None, False)
+        if self.jump_dodge and me.get('grounded') and (best[2] < 1.9) and (self.rng.random() < self.jump_p) and (me['energy'] > 10):
+            self.want_jump = True
         return ([best[0], best[1]], best[2] > 0.8)
 
     def detect_ffa(self, obs, mechs, npcs):
