@@ -53,6 +53,11 @@ class Bot:
         self.my_kills = 0
         self.retreating = False
         self.farm_until = 200.0
+        self.r1, self.r2, self.r3, self.rexit = (0.4, 0.9, 0.97, 0.88)
+        self.hp_hist = {}
+        self.third_hp = 0.6
+        self.energy_reserve = 30
+        self.drop_range = 220
         import os, json as _json
         self.debug = bool(os.environ.get('BOT_DEBUG'))
         self.dodge_on = True
@@ -239,6 +244,12 @@ class Bot:
             if s['kind'] in ('gun', 'laser', 'laser_charge', 'lightning', 'mortar', 'boost', 'step', 'jet') and s['dist'] != 'far':
                 self.last_sound = (t, s['bearing'], s['dist'])
         mechs = [m for m in obs['mechs'] if m['kind'] == 'mech']
+        my_hit_ids = {e['target'] for e in obs['events'] if e['type'] == 'hit'}
+        for m in mechs:
+            hist = self.hp_hist.setdefault(m['id'], [])
+            hist.append((t, m['hp'], m['id'] in my_hit_ids))
+            while hist and t - hist[0][0] > 2.5:
+                hist.pop(0)
         npcs = [m for m in obs['mechs'] if m['kind'] == 'npc']
         for m in mechs:
             self.enemies[m['id']] = dict(m, t=t)
@@ -258,6 +269,12 @@ class Bot:
             closing = v[0] * math.cos(to_me) + v[1] * math.sin(to_me) > 4
             return dd < 140 and aiming and closing
 
+        def busy(m):
+            hist = self.hp_hist.get(m['id'], [])
+            if len(hist) < 3 or any((h[2] for h in hist)):
+                return False
+            return hist[0][1] - hist[-1][1] > 120
+
         def weak(m):
             return m['hp'] < m['max_hp'] * 0.35 and d2(m['pos'], pos) < 140 and (hpf > 0.5) and (m['hp'] < me['hp'] * 0.5)
         seen_any = [m for m in threats]
@@ -265,7 +282,7 @@ class Bot:
             self.last_seen_mech_t = t
         self.detect_ffa(obs, mechs, npcs)
         if self.ffa or t < self.practice_confirm_t:
-            fight = [m for m in threats if hostile(m) or weak(m)]
+            fight = [m for m in threats if hostile(m) or weak(m) or (self.ffa and busy(m) and (m['hp'] < m['max_hp'] * self.third_hp) and (hpf > 0.55) and (d2(m['pos'], pos) < 160))]
         else:
             fight = [m for m in threats if hostile(m) or weak(m) or (hpf > self.practice_aggro_hp and d2(m['pos'], pos) < self.practice_aggro_range)]
         watchers = [m for m in threats if m not in fight and d2(m['pos'], pos) < 170]
@@ -297,14 +314,14 @@ class Bot:
         close_enemy = target is not None and d2(target['pos'], pos) < 50
         n_close = sum((1 for m in fight if d2(m['pos'], pos) < 120))
         if target is not None:
-            if hpf < 0.4 and (not (n_close <= 1 and target['hp'] < me['hp'] * 0.6)):
+            if hpf < self.r1 and (not (n_close <= 1 and target['hp'] < me['hp'] * 0.6)):
                 self.retreating = True
-            if n_close >= 2 and hpf < 0.65:
+            if n_close >= 2 and hpf < self.r2:
                 self.retreating = True
-            if n_close >= 3 and hpf < 0.85:
+            if n_close >= 3 and hpf < self.r3:
                 self.retreating = True
         if self.retreating:
-            if hpf > 0.88:
+            if hpf > self.rexit:
                 self.retreating = False
             elif target is not None and n_close <= 1 and (target['hp'] < me['hp'] * 0.45):
                 self.retreating = False
@@ -324,6 +341,11 @@ class Bot:
             goal = [c[0] + (pos[0] - c[0]) * 0.3, c[1] + (pos[1] - c[1]) * 0.3]
             mv = self.steer(t, pos, goal)
             boost = not in_zone or me['energy'] > 50
+        elif self.drop_goal(obs, me, target) is not None:
+            dg = self.drop_goal(obs, me, target)
+            self.mode = 'drop'
+            mv = self.steer(t, pos, dg['pos']) if d2(dg['pos'], pos) > 3 else [0.0, 0.0]
+            boost = d2(dg['pos'], pos) > 40 and me['energy'] > self.energy_reserve
         elif target is not None and self.retreating:
             self.mode = 'retreat'
             if t - self.cover_t > 1.0 or self.cover is None:
@@ -381,6 +403,8 @@ class Bot:
             for s, w in enumerate(me['weapons']):
                 if w and w['kind'] == 'laser' and (w.get('charge', 0) > 0):
                     fire[s] = True
+        if boost and me['energy'] < self.energy_reserve and (self.mode not in ('retreat', 'zone')) and in_zone:
+            boost = False
         if self.dodge_on:
             dv, dboost = self.dodge(obs, me, mechs)
             if dv is not None:
@@ -400,6 +424,21 @@ class Bot:
             mf.log(f"t={t:.0f} {self.mode} hp={me['hp']:.0f}/{me['max_hp']:.0f} cubes={me['cubes']} w={[w['kind'] if w else None for w in me['weapons']]} tgt={(target['id'] if target else None)} vis={vis[:4]} dmg={len(self.dmg_log)}")
         mf.draw.label(f"{self.mode} hp{me['hp']:.0f} {(time.perf_counter() - t0) * 1000:.0f}ms")
         return act
+
+    def drop_goal(self, obs, me, target):
+        pos = me['pos']
+        if target is not None and d2(target['pos'], pos) < 90:
+            return None
+        best = None
+        for dr in obs.get('drops', []):
+            if dr['holder'] not in (None, me['id']) and dr.get('progress', 0) > 1.5:
+                continue
+            dd = d2(dr['pos'], pos)
+            eta = dd / 15.0
+            if dd < self.drop_range and dr['lands_in'] < eta + 12 and self.point_in_safe(obs, dr['pos'], 1.0):
+                if best is None or dd < d2(best['pos'], pos):
+                    best = dr
+        return best
 
     def dodge(self, obs, me, mechs):
         pos = me['pos']
