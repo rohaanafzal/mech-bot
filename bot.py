@@ -50,6 +50,8 @@ class Bot:
         self.practice_aggro_hp = 0.6
         self.practice_aggro_range = 110
         self.practice_confirm_t = 40.0
+        self.my_kills = 0
+        self.retreating = False
         self.farm_until = 200.0
         import os
         self.debug = bool(os.environ.get('BOT_DEBUG'))
@@ -289,7 +291,22 @@ class Bot:
         hostile_close = target is not None and (target['id'] in recent_attackers or d2(target['pos'], pos) < 80)
         loot_cubes = [q for q in obs['cubes'] if d2(q['pos'], pos) < 45 and abs(q['pos'][2] - pos[2]) < 4]
         close_enemy = target is not None and d2(target['pos'], pos) < 50
-        if want_w is not None and in_zone and (not hostile_close):
+        n_close = sum((1 for m in fight if d2(m['pos'], pos) < 120))
+        if target is not None:
+            if hpf < 0.4 and (not (n_close <= 1 and target['hp'] < me['hp'] * 0.6)):
+                self.retreating = True
+            if n_close >= 2 and hpf < 0.65:
+                self.retreating = True
+            if n_close >= 3 and hpf < 0.85:
+                self.retreating = True
+        if self.retreating:
+            if hpf > 0.88:
+                self.retreating = False
+            elif target is not None and n_close <= 1 and (target['hp'] < me['hp'] * 0.45):
+                self.retreating = False
+            elif target is None and (not self.dmg_log) and (t - self.last_fight_t > 25):
+                self.retreating = False
+        if want_w is not None and in_zone and (not hostile_close) and (not self.retreating):
             self.mode = 'arm'
             mv = self.steer(t, pos, want_w['pos'])
             boost = me['energy'] > 30 and d2(want_w['pos'], pos) > 25
@@ -303,7 +320,7 @@ class Bot:
             goal = [c[0] + (pos[0] - c[0]) * 0.3, c[1] + (pos[1] - c[1]) * 0.3]
             mv = self.steer(t, pos, goal)
             boost = not in_zone or me['energy'] > 50
-        elif target is not None and hpf < 0.38 and (target['hp'] > me['hp'] * 0.6):
+        elif target is not None and self.retreating:
             self.mode = 'retreat'
             if t - self.cover_t > 1.0 or self.cover is None:
                 self.cover = self.find_cover(obs, me, threats)
@@ -379,6 +396,12 @@ class Bot:
         if self.ffa:
             return
         t = obs['t']
+        self.my_kills += sum((1 for e in obs['events'] if e['type'] == 'kill'))
+        unexplained = 16 - obs['alive'] - self.my_kills
+        if unexplained >= 2:
+            self.ffa = True
+            mf.log(f'FFA detected (deaths) at t={t}')
+            return
         mine = {e['target'] for e in obs['events'] if e['type'] == 'hit'}
         z = obs['zone']
         for m in mechs:
