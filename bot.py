@@ -54,6 +54,8 @@ class Bot:
         self.farm_id = None
         self.last_fight_t = -99.0
         self.heal_below = 0.9
+        self.last_seen_mech_t = -99.0
+        self.farm_until = 200.0
         import os
         self.debug = bool(os.environ.get("BOT_DEBUG"))
 
@@ -256,19 +258,24 @@ class Bot:
             if m["id"] in recent_attackers:
                 return True
             dd = d2(m["pos"], pos)
-            if dd < 70:
+            if dd < 55:
                 return True
-            # walking at us or aiming at us
             to_me = math.atan2(pos[1] - m["pos"][1], pos[0] - m["pos"][0])
-            aiming = abs(wrap(m.get("aim", [0, 0])[0] - to_me)) < 0.35
+            aiming = abs(wrap(m.get("aim", [0, 0])[0] - to_me)) < 0.3
             v = m.get("vel", [0, 0, 0])
-            closing = (v[0] * math.cos(to_me) + v[1] * math.sin(to_me)) > 3
-            return aiming or closing
-        hostile_threats = [m for m in threats if hostile(m)]
-        if not hostile_threats and hpf < 0.75:
-            threats = []
-        elif hostile_threats:
-            threats = hostile_threats
+            closing = (v[0] * math.cos(to_me) + v[1] * math.sin(to_me)) > 4
+            return dd < 140 and aiming and closing
+
+        def weak(m):
+            return (m["hp"] < m["max_hp"] * 0.35 and d2(m["pos"], pos) < 140 and hpf > 0.5
+                    and m["hp"] < me["hp"] * 0.5)
+
+        seen_any = [m for m in threats]
+        if seen_any:
+            self.last_seen_mech_t = t
+        fight = [m for m in threats if hostile(m) or weak(m)]
+        watchers = [m for m in threats if m not in fight and d2(m["pos"], pos) < 170]
+        threats = fight
         # ---- weapons on the ground
         self.handle_loot(obs, me, act)
         # ---- pick a target
@@ -311,6 +318,12 @@ class Bot:
             self.mode = "fight"
             mv = self.fight_move(obs, me, target)
             boost = me["energy"] > 60 and d2(target["pos"], pos) > 120
+        elif watchers and target is None:
+            self.mode = "evade"
+            if t - self.cover_t > 1.5 or self.cover is None:
+                self.cover = self.find_cover(obs, me, watchers)
+                self.cover_t = t
+            mv = self.steer(t, pos, self.cover) if self.cover and d2(self.cover, pos) > 2.5 else [0.0, 0.0]
         elif hpf < self.heal_below and (t - self.last_fight_t) < 40:
             self.mode = "heal"
             if self.hold is None or t - self.hold_t > 15 or not self.point_in_safe(obs, self.hold, 0.7):
@@ -324,7 +337,7 @@ class Bot:
             self.last_fight_t = t
         # ---- aim & fire
         shoot = target
-        if shoot is None and self.mode == "roam" and hpf > 0.6:
+        if shoot is None and self.mode == "roam" and hpf > 0.6 and t - self.last_seen_mech_t > 8 and t < self.farm_until:
             shoot = self.farm_target(obs, me, npcs)
         if shoot is not None:
             aim, fire = self.weapons(obs, me, shoot)
@@ -332,6 +345,9 @@ class Bot:
             # face whoever hurt us, then sounds, otherwise look where we're going / scan
             if self.dmg_log and self.dmg_log[-1][1] is not None:
                 aim = [self.dmg_log[-1][1], 0.0]
+            elif watchers:
+                wm = min(watchers, key=lambda m: d2(m["pos"], pos))
+                aim = [math.atan2(wm["pos"][1] - pos[1], wm["pos"][0] - pos[0]), 0.0]
             elif self.last_sound and t - self.last_sound[0] < 2.0:
                 aim = [self.last_sound[1], 0.0]
             elif self.mode == "hold":
@@ -421,7 +437,7 @@ class Bot:
         if want and d2(want["pos"], pos) < 90:
             return self.steer(t, pos, want["pos"]), False
         # farm crates / drones early, from a distance
-        if t < 300:
+        if t < self.farm_until and t - self.last_seen_mech_t > 8:
             tgt = self.farm_target(obs, me, npcs)
             if tgt is not None:
                 dd = d2(tgt["pos"], pos)
